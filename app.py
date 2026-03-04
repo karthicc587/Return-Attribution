@@ -371,7 +371,7 @@ def _bar_color(val, base):
 # App layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("📈 Portfolio Analyzer TEST")
+st.title("📈 Portfolio Analyzer")
 st.markdown("Upload your two Fidelity CSV exports below to analyze portfolio performance.")
 
 col_up1, col_up2 = st.columns(2)
