@@ -723,14 +723,40 @@ def load_ff_factors(lookback_years: int) -> pd.DataFrame:
         "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip",
     )
 
+    # Normalise FF3 column names — French sometimes uses "Mkt-RF" or "MKT-RF"
+    # Standardise to uppercase and strip whitespace
+    ff3.columns = [c.strip().upper().replace("MKT-RF", "MKT-RF") for c in ff3.columns]
+    # Map any variant spellings to canonical names
+    ff3_rename = {}
+    for col in ff3.columns:
+        cu = col.upper().replace(" ", "")
+        if "MKT" in cu and "RF" in cu:
+            ff3_rename[col] = "MKT-RF"
+        elif cu == "SMB":
+            ff3_rename[col] = "SMB"
+        elif cu == "HML":
+            ff3_rename[col] = "HML"
+        elif cu == "RF":
+            ff3_rename[col] = "RF"
+    ff3 = ff3.rename(columns=ff3_rename)
+
     # Momentum factor monthly
     mom = _fetch_ff_zip(
         "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip",
     )
-    # Momentum column may be named "Mom   " — rename to WML
+    # Momentum column may be "Mom", "WML", "PR1YR", etc. — just take the first data column
     mom.columns = ["WML"]
 
     factors = ff3.join(mom, how="inner")
+
+    # Verify required columns are present before returning
+    required = {"MKT-RF", "SMB", "HML", "RF", "WML"}
+    missing_cols = required - set(factors.columns)
+    if missing_cols:
+        raise ValueError(
+            f"FF factor data missing expected columns: {missing_cols}. "
+            f"Got: {list(factors.columns)}"
+        )
 
     # Trim to lookback window
     cutoff = pd.Timestamp.today() - pd.DateOffset(years=lookback_years)
@@ -828,10 +854,14 @@ if ff_ok:
     with st.expander("Factor regression diagnostics", expanded=False):
         st.write(f"**FF factors:** {len(ff_factors)} months, "
                  f"{ff_factors.index[0].date()} → {ff_factors.index[-1].date()}")
+        st.write(f"**FF columns:** {list(ff_factors.columns)}")
         if not monthly_rets.empty:
             st.write(f"**Monthly returns:** {len(monthly_rets)} rows, "
                      f"{monthly_rets.index[0].date()} → {monthly_rets.index[-1].date()}")
             st.write(f"**Tickers fetched:** {list(monthly_rets.columns)}")
+            # Show sample of index to confirm month-end alignment
+            st.write(f"**Return index sample:** {[str(d.date()) for d in monthly_rets.index[:3]]}")
+            st.write(f"**FF index sample:** {[str(d.date()) for d in ff_factors.index[:3]]}")
         else:
             st.write("**Monthly returns:** empty — yfinance returned no data")
 
