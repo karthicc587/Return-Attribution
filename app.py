@@ -16,6 +16,10 @@ from datetime import date, datetime, timedelta
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pandas_datareader as pdr
+import statsmodels.api as sm
 import streamlit as st
 import yfinance as yf
 from matplotlib.ticker import FuncFormatter
@@ -626,3 +630,291 @@ if er_ru is not None:
         )
         st.pyplot(fig_ru, use_container_width=True)
         plt.close(fig_ru)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Section 7 — Factor Betas (Fama-French 4-Factor)
+# ═════════════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.subheader("Factor Betas")
+st.markdown(
+    "4-factor regression (MKT, SMB, HML, WML) for each current equity position "
+    "and the portfolio as a whole. Uses 3 years of monthly returns."
+)
+
+LOOKBACK_YEARS = 3
+FACTORS        = ["MKT-RF", "SMB", "HML", "WML"]
+FACTOR_LABELS  = {"MKT-RF": "Market (β)", "SMB": "SMB (Size)", "HML": "HML (Value)", "WML": "WML (Momentum)"}
+FACTOR_COLORS  = {"MKT-RF": "#1d4ed8", "SMB": "#b91c1c", "HML": "#15803d", "WML": "#7c3aed"}
+
+@st.cache_data(show_spinner=False)
+def load_ff_factors(lookback_years: int) -> pd.DataFrame:
+    """
+    Download Fama-French 3-factor + momentum monthly data via pandas-datareader.
+    Returns a DataFrame indexed by month-end date with columns:
+        MKT-RF, SMB, HML, WML, RF  (all as decimals, e.g. 0.012)
+    """
+    end_dt   = datetime.today()
+    start_dt = end_dt.replace(year=end_dt.year - lookback_years)
+
+    ff3  = pdr.get_data_famafrench("F-F_Research_Data_Factors",  start=start_dt, end=end_dt)[0]
+    mom  = pdr.get_data_famafrench("F-F_Momentum_Factor",         start=start_dt, end=end_dt)[0]
+
+    # Both are in percent — convert to decimal
+    ff3 = ff3 / 100.0
+    mom = mom / 100.0
+    mom.columns = ["WML"]
+
+    factors = ff3.join(mom, how="inner")
+    factors.index = factors.index.to_timestamp(how="end").normalize()
+    return factors
+
+
+@st.cache_data(show_spinner=False)
+def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.DataFrame:
+    """Download monthly closing prices and compute returns for a list of tickers."""
+    raw = yf.download(
+        list(tickers),
+        start=start_str,
+        end=end_str,
+        interval="1mo",
+        auto_adjust=True,
+        progress=False,
+    )
+    if raw.empty:
+        return pd.DataFrame()
+
+    close = raw["Close"] if len(tickers) > 1 else raw[["Close"]]
+    if len(tickers) == 1:
+        close.columns = list(tickers)
+
+    returns = close.pct_change().dropna(how="all")
+    returns.index = returns.index.normalize()
+    return returns
+
+
+def run_ff_regression(excess_returns: pd.Series, factors: pd.DataFrame):
+    """
+    OLS regression of a stock's excess returns on the 4 factors.
+    Returns dict with beta for each factor, alpha, r_squared, and significance flags.
+    """
+    aligned = factors.join(excess_returns.rename("r"), how="inner").dropna()
+    if len(aligned) < 12:
+        return None   # not enough data
+
+    X = sm.add_constant(aligned[FACTORS])
+    y = aligned["r"]
+    model = sm.OLS(y, X).fit()
+
+    result = {"alpha": model.params["const"], "r_squared": model.rsquared, "n_obs": len(aligned)}
+    for f in FACTORS:
+        result[f]              = model.params[f]
+        result[f + "_tstat"]   = model.tvalues[f]
+        result[f + "_sig"]     = abs(model.tvalues[f]) > 1.96   # 95% significance
+    return result
+
+
+# ── Load factor data ──────────────────────────────────────────────────────────
+with st.spinner("Loading Fama-French factor data..."):
+    try:
+        ff_factors = load_ff_factors(LOOKBACK_YEARS)
+        ff_ok = True
+    except Exception as e:
+        st.warning(f"Could not load Fama-French data: {e}")
+        ff_ok = False
+
+if ff_ok:
+    # Current equity positions only (exclude CASH and PENDING)
+    equity_positions = {
+        sym: qty for sym, qty in current_positions.items()
+        if sym not in ("CASH", "PENDING") and qty > 0
+    }
+
+    factor_start = ff_factors.index[0].strftime("%Y-%m-%d")
+    factor_end   = ff_factors.index[-1].strftime("%Y-%m-%d")
+
+    with st.spinner("Fetching monthly price history for factor regressions..."):
+        monthly_rets = get_monthly_returns(
+            tickers   = tuple(sorted(equity_positions.keys())),
+            start_str = factor_start,
+            end_str   = factor_end,
+        )
+
+    # Run regression for each ticker
+    betas_rows   = []
+    per_ticker   = {}
+
+    for sym in sorted(equity_positions.keys()):
+        if sym not in monthly_rets.columns:
+            continue
+        stock_ret    = monthly_rets[sym].dropna()
+        rf           = ff_factors["RF"].reindex(stock_ret.index)
+        excess       = (stock_ret - rf).dropna()
+        result       = run_ff_regression(excess, ff_factors)
+        if result is None:
+            continue
+        per_ticker[sym] = result
+        betas_rows.append({
+            "Ticker":   sym,
+            "Market β": round(result["MKT-RF"], 3),
+            "SMB":      round(result["SMB"],    3),
+            "HML":      round(result["HML"],    3),
+            "WML":      round(result["WML"],    3),
+            "α (mo.)":  f"{result['alpha']*100:+.2f}%",
+            "R²":       f"{result['r_squared']:.2f}",
+            "Obs.":     result["n_obs"],
+        })
+
+    # ── Portfolio-level weighted betas ───────────────────────────────────────
+    # Weight by current market value (shares × latest price)
+    latest_prices = {
+        sym: get_price_on_or_before(price_data.get(sym, {}), end_date)
+        for sym in equity_positions
+    }
+    market_vals = {
+        sym: equity_positions[sym] * latest_prices[sym]
+        for sym in equity_positions
+        if latest_prices.get(sym) and sym in per_ticker
+    }
+    total_equity_val = sum(market_vals.values())
+
+    port_betas = {f: 0.0 for f in FACTORS}
+    if total_equity_val > 0:
+        for sym, mv in market_vals.items():
+            w = mv / total_equity_val
+            for f in FACTORS:
+                port_betas[f] += w * per_ticker[sym][f]
+
+    # ── Table ─────────────────────────────────────────────────────────────────
+    if betas_rows:
+        df_betas = pd.DataFrame(betas_rows)
+
+        # Colour-code numeric beta columns via pandas Styler
+        def _colour_beta(val):
+            try:
+                v = float(val)
+                if v > 0.15:   return "color: #15803d; font-weight:600"
+                if v < -0.15:  return "color: #b91c1c; font-weight:600"
+            except (TypeError, ValueError):
+                pass
+            return "color: #374151"
+
+        styled = (
+            df_betas.style
+            .applymap(_colour_beta, subset=["Market β", "SMB", "HML", "WML"])
+            .set_properties(**{"text-align": "center"})
+            .set_table_styles([{"selector": "th", "props": [("text-align", "center")]}])
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        # ── Portfolio summary metrics ─────────────────────────────────────────
+        st.markdown("**Portfolio-level factor exposures** (market-value weighted)")
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        factor_meta = [
+            ("MKT-RF", "Market β",     mc1),
+            ("SMB",    "SMB",          mc2),
+            ("HML",    "HML",          mc3),
+            ("WML",    "WML (Mom.)",   mc4),
+        ]
+        for fkey, flabel, col in factor_meta:
+            val = port_betas[fkey]
+            col.metric(flabel, f"{val:+.3f}")
+
+        # ── Visualisation ─────────────────────────────────────────────────────
+        st.markdown("---")
+
+        # 1. Portfolio beta bar chart
+        fig_pb, ax_pb = plt.subplots(figsize=(8, 4))
+        fig_pb.patch.set_facecolor(BG)
+        ax_pb.set_facecolor(BG)
+
+        pb_labels = [FACTOR_LABELS[f] for f in FACTORS]
+        pb_values = [port_betas[f] for f in FACTORS]
+        pb_colors = [FACTOR_COLORS[f] for f in FACTORS]
+        pb_bars   = ax_pb.bar(pb_labels, pb_values, color=pb_colors,
+                              width=0.45, edgecolor=BG, zorder=3)
+
+        y_ext = max(abs(v) for v in pb_values) if pb_values else 1
+        pad   = y_ext * 0.25 + 0.05
+        ax_pb.set_ylim(-y_ext - pad, y_ext + pad)
+
+        for bar, val in zip(pb_bars, pb_values):
+            is_pos = val >= 0
+            ax_pb.text(
+                bar.get_x() + bar.get_width() / 2,
+                val + (pad * 0.35 if is_pos else -pad * 0.35),
+                f"{val:+.3f}",
+                ha="center", va="bottom" if is_pos else "top",
+                fontsize=11, fontweight="bold", color=bar.get_facecolor(),
+            )
+
+        ax_pb.axhline(0, color=LIGHT, linewidth=1.2, zorder=2)
+        ax_pb.set_title(
+            "Portfolio Factor Exposures" + "\n" + "Market-value weighted betas",
+            fontsize=13, fontweight="bold", pad=12, loc="left", color=DARK,
+        )
+        ax_pb.set_ylabel("Beta", fontsize=10.5, color=GRAY, labelpad=8)
+        ax_pb.tick_params(axis="x", bottom=False, labelsize=10.5, colors=GRAY)
+        ax_pb.tick_params(axis="y", colors=GRAY, labelsize=9)
+        ax_pb.spines["top"].set_visible(False)
+        ax_pb.spines["right"].set_visible(False)
+        ax_pb.spines["left"].set_color(LIGHT)
+        ax_pb.spines["bottom"].set_color(LIGHT)
+        ax_pb.grid(axis="y", linestyle="--", alpha=0.4, color=LIGHT, zorder=0)
+        ax_pb.set_axisbelow(True)
+        plt.tight_layout(pad=1.8)
+        st.pyplot(fig_pb, use_container_width=True)
+        plt.close(fig_pb)
+
+        # 2. Per-ticker heatmap
+        st.markdown("**Per-position factor betas**")
+        hm_data = df_betas.set_index("Ticker")[["Market β", "SMB", "HML", "WML"]].astype(float)
+
+        fig_hm, ax_hm = plt.subplots(
+            figsize=(max(7, len(hm_data.columns) * 1.6),
+                     max(4, len(hm_data) * 0.38 + 1.2))
+        )
+        fig_hm.patch.set_facecolor(BG)
+        ax_hm.set_facecolor(BG)
+
+        mat    = hm_data.values
+        vmax   = np.percentile(np.abs(mat[~np.isnan(mat)]), 95) if mat.size else 1
+        im     = ax_hm.imshow(mat, cmap="RdYlGn", aspect="auto",
+                               vmin=-vmax, vmax=vmax)
+
+        ax_hm.set_xticks(range(len(hm_data.columns)))
+        col_label_map = {"Market β": "Market (β)", "SMB": "SMB (Size)",
+                             "HML": "HML (Value)", "WML": "WML (Momentum)"}
+        ax_hm.set_xticklabels(
+            [col_label_map.get(c, c) for c in hm_data.columns],
+            fontsize=10.5, color=DARK, fontweight="semibold"
+        )
+        ax_hm.set_yticks(range(len(hm_data.index)))
+        ax_hm.set_yticklabels(hm_data.index, fontsize=9, color=GRAY)
+        ax_hm.tick_params(length=0)
+
+        for i in range(len(hm_data.index)):
+            for j in range(len(hm_data.columns)):
+                val = mat[i, j]
+                if not np.isnan(val):
+                    text_color = "white" if abs(val) > vmax * 0.6 else DARK
+                    ax_hm.text(j, i, f"{val:+.2f}", ha="center", va="center",
+                               fontsize=8.5, color=text_color, fontweight="600")
+
+        cbar = fig_hm.colorbar(im, ax=ax_hm, fraction=0.025, pad=0.02)
+        cbar.ax.tick_params(labelsize=8, colors=GRAY)
+        cbar.outline.set_edgecolor(LIGHT)
+
+        ax_hm.set_title(
+            "Factor Beta Heatmap  ·  Per Position" + "\n"
+            + f"3-year monthly regression  ·  Green = positive exposure, Red = negative",
+            fontsize=12, fontweight="bold", pad=12, loc="left", color=DARK,
+        )
+        ax_hm.spines[:].set_visible(False)
+        plt.tight_layout(pad=1.5)
+        st.pyplot(fig_hm, use_container_width=True)
+        plt.close(fig_hm)
+
+    else:
+        st.warning("No factor regressions could be completed — insufficient price history for current positions.")
