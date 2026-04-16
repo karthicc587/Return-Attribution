@@ -25,6 +25,7 @@ def clean_currency(value):
         return 0.0
 
 def extract_date_from_filename(filename):
+    """Extracts date from 'Portfolio_Positions_Apr-15-2026' format."""
     match = re.search(r'([A-Z][a-z]{2}-\d{2}-\d{4})', filename)
     if match:
         return datetime.strptime(match.group(1), '%b-%d-%Y')
@@ -33,27 +34,30 @@ def extract_date_from_filename(filename):
 # --- Streamlit UI ---
 st.set_page_config(page_title="Portfolio Reconstructor", layout="wide")
 st.title("📈 Portfolio Historical Reconstruction")
-st.markdown("Reconstruct your daily portfolio value by backtracking from current positions.")
+st.markdown("""
+This tool reconstructs your portfolio value day-by-day by backtracking from your current positions 
+using your transaction history and Yahoo Finance market data.
+""")
 
 col1, col2 = st.columns(2)
 with col1:
-    pos_file = st.file_uploader("Upload Positions CSV (Portfolio_Positions_...)", type=["csv"])
+    pos_file = st.file_uploader("Upload Positions CSV", type=["csv"])
 with col2:
-    hist_file = st.file_uploader("Upload History CSV (History_for_...)", type=["csv"])
+    hist_file = st.file_uploader("Upload History CSV", type=["csv"])
 
 if pos_file and hist_file:
-    # 1. Load Data with index_col=False to prevent column shifting
+    # 1. Load Data
+    # index_col=False is critical to prevent column shifting
     end_date = extract_date_from_filename(pos_file.name)
     pos_df = pd.read_csv(pos_file, index_col=False)
     hist_df = pd.read_csv(hist_file, skiprows=2, index_col=False)
     
     # 2. Extract Current State (End Date)
-    # Filter out footer rows
+    # Filter rows to keep only valid positions or pending activity
     pos_df = pos_df[pos_df['Symbol'].notna() | pos_df['Account Name'].str.contains('Pending', na=False)].copy()
     
     # Identify Cash components (SPAXX + Pending)
     spaxx_row = pos_df[pos_df['Symbol'] == 'SPAXX**']
-    # Check both Symbol and Account Name for 'Pending activity' due to potential shifts
     pending_row = pos_df[pos_df['Symbol'] == 'Pending activity']
     if pending_row.empty:
         pending_row = pos_df[pos_df['Account Name'] == 'Pending activity']
@@ -70,7 +74,6 @@ if pos_file and hist_file:
     for _, row in stocks_df.iterrows():
         ticker = str(row['Symbol']).strip()
         if ticker and ticker != 'nan':
-            # Use clean_currency on quantity too, as it might have commas
             current_positions[ticker] = clean_currency(row['Quantity'])
 
     # 3. Process History
@@ -79,20 +82,25 @@ if pos_file and hist_file:
     hist_df = hist_df.sort_values('Run Date', ascending=False)
     start_date = hist_df['Run Date'].min()
     
+    # Collect all tickers that ever existed in the portfolio
     all_tickers = sorted(list(set(list(current_positions.keys()) + hist_df['Symbol'].dropna().unique().tolist())))
-    # Remove cash-like symbols from yfinance list
-    all_tickers = [t for t in all_tickers if t not in ['SPAXX**', 'SPAXX', 'Cash']]
+    all_tickers = [t for t in all_tickers if t not in ['SPAXX**', 'SPAXX', 'Cash', 'Pending activity']]
 
     # 4. Fetch Historical Prices
-    with st.spinner(f"Fetching historical prices for {len(all_tickers)} tickers..."):
-        # We fetch from start_date to end_date
+    with st.spinner(f"Fetching market data for {len(all_tickers)} tickers..."):
         price_data = yf.download(all_tickers, start=start_date, end=end_date + pd.Timedelta(days=1))['Close']
-        price_data = price_data.ffill().bfill() # Handle weekends/holidays
+        
+        # DROPPING HOLIDAYS: Remove rows where all tickers are NaN (Market was closed)
+        price_data = price_data.dropna(how='all')
+        
+        # Fill missing data for individual tickers (stale prices)
+        price_data = price_data.ffill().bfill()
 
     # 5. Reconstruct Timeline (Backwards)
     history_records = []
-    # Get all business days in the range, reversed (Newest to Oldest)
-    trading_days = pd.date_range(start=start_date, end=end_date, freq='B')[::-1]
+    
+    # Use the price_data index to ensure we only iterate on valid trading days
+    trading_days = price_data.index.sort_values(ascending=False)
     
     temp_positions = current_positions.copy()
     temp_cash = current_cash
@@ -100,11 +108,10 @@ if pos_file and hist_file:
     for current_day in trading_days:
         day_ts = pd.Timestamp(current_day)
         
-        # A. Calculate total value for the end of THIS day
+        # A. Calculate total value for the end of THIS trading day
         market_value = 0
         for t, q in temp_positions.items():
             if q != 0 and t in price_data.columns:
-                # Get closest available price for that day
                 try:
                     price = price_data.loc[day_ts, t]
                     market_value += (q * price)
@@ -126,29 +133,30 @@ if pos_file and hist_file:
             tx_qty = float(tx['Quantity']) if not pd.isna(tx['Quantity']) else 0
             tx_amt = clean_currency(tx['Amount ($)'])
             
-            # If we bought today (qty > 0), we had FEWER shares yesterday
+            # If we bought today, we had fewer shares yesterday
             if tx_ticker in temp_positions:
                 temp_positions[tx_ticker] -= tx_qty
             else:
                 temp_positions[tx_ticker] = -tx_qty
             
-            # If cash left today (Amount is negative for buy), we had MORE cash yesterday
+            # Reverse cash impact
             temp_cash -= tx_amt
 
     # 6. Display Results
     reconstructed_df = pd.DataFrame(history_records).sort_values("Date")
     
-    st.subheader("Total Portfolio Value Over Time")
+    st.subheader("Performance Summary")
     st.line_chart(reconstructed_df.set_index("Date")["Total Portfolio Value"])
     
-    st.subheader("Daily Breakdown")
     st.dataframe(reconstructed_df, use_container_width=True)
     
-    # Download Button
+    # Excel/CSV Export
     csv = reconstructed_df.to_csv(index=False).encode('utf-8')
     st.download_button(
-        label="Download Full Reconstruction (CSV)",
+        label="Download Reconstruction (CSV)",
         data=csv,
-        file_name=f"Portfolio_Reconstruction_{datetime.now().strftime('%Y%m%d')}.csv",
+        file_name=f"Portfolio_History_{datetime.now().strftime('%Y%m%d')}.csv",
         mime='text/csv',
     )
+    
+    st.success("Reconstruction complete. All holiday 'zeroes' have been filtered out.")
