@@ -147,7 +147,7 @@ if pos_file and hist_file:
     m1.metric("Average AUM", f"${avg_value:,.2f}")
     m2.metric("Total Buys", f"${buys:,.2f}")
     m3.metric("Total Sells", f"${sells:,.2f}")
-    m4.metric("Annualized Turnover", f"{annualized_turnover:.2%}")
+    m4.metric("Turnover Ratio", f"{turnover_ratio:.2%}")
 
     # Charts
     df['Portfolio (Indexed 100)'] = (df['Total Portfolio Value'] / df['Total Portfolio Value'].iloc[0]) * 100
