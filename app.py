@@ -3,8 +3,9 @@ import pandas as pd
 import yfinance as yf
 import re
 from datetime import datetime
+import time
 
-# --- Robust Data Cleaning ---
+# --- Helper Functions ---
 def clean_currency(value):
     if pd.isna(value) or str(value).strip() in ['', '--']: 
         return 0.0
@@ -28,19 +29,13 @@ def extract_date_from_filename(filename):
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Portfolio Analysis Tool", layout="wide")
-st.title("📈 Portfolio Performance & Factor ETF Comparison")
+st.title("📈 Portfolio Performance & Turnover Analysis")
 
 col1, col2 = st.columns(2)
 with col1:
     pos_file = st.file_uploader("Upload Positions CSV", type=["csv"])
 with col2:
     hist_file = st.file_uploader("Upload History CSV", type=["csv"])
-
-# Define Factor ETF Proxies
-# SMB: iShares Russell 2000 (Small Cap)
-# HML: iShares MSCI USA Value Factor
-# WML: iShares MSCI USA Momentum Factor
-FACTOR_ETFS = {"IWM": "SMB Proxy", "VLUE": "HML Proxy", "MTUM": "WML Proxy"}
 
 if pos_file and hist_file:
     # 1. Load Data
@@ -71,36 +66,46 @@ if pos_file and hist_file:
     hist_df = hist_df.sort_values('Run Date', ascending=False)
     start_date = hist_df['Run Date'].min()
     
-    # Add Portfolio Tickers + Russell 3000 + Factor ETFs to the download list
-    portfolio_tickers = list(current_positions.keys()) + hist_df['Symbol'].dropna().unique().tolist()
-    all_tickers = sorted(list(set(portfolio_tickers + list(FACTOR_ETFS.keys()) + ["^RUA"])))
+    # SANITIZE TICKERS: Remove empty strings and whitespace
+    raw_ticker_list = list(set(list(current_positions.keys()) + hist_df['Symbol'].dropna().unique().tolist()))
+    all_tickers = [t.strip() for t in raw_ticker_list if t and str(t).strip() != '' and str(t).strip() != 'nan']
     all_tickers = [t for t in all_tickers if t not in ['SPAXX**', 'SPAXX', 'Cash', 'Pending activity']]
+    all_tickers = sorted(list(set(all_tickers + ["^RUA", "IWM", "VLUE", "MTUM"])))
 
-    # 4. Fetch Historical Prices
-    with st.spinner("Fetching market data (Portfolio, Russell 3000, and Factor ETFs)..."):
-        raw_prices = yf.download(all_tickers, start=start_date, end=end_date + pd.Timedelta(days=1))['Close']
+    # 4. Fetch Historical Prices with Rate Limit Handling
+    with st.spinner("Fetching market data..."):
+        try:
+            raw_prices = yf.download(all_tickers, start=start_date, end=end_date + pd.Timedelta(days=1), progress=False)['Close']
+        except Exception:
+            time.sleep(2) # Retry once on failure
+            raw_prices = yf.download(all_tickers, start=start_date, end=end_date + pd.Timedelta(days=1), progress=False)['Close']
         
-        # Ensure we have a clean DataFrame and handle holidays
         prices = raw_prices.dropna(how='all').ffill().bfill()
-        
-        # Russell 3000 Index specifically
-        benchmark_data = prices["^RUA"] if "^RUA" in prices.columns else None
 
     # 5. Reconstruct Timeline
     history_records = []
     trading_days = prices.index.sort_values(ascending=False)
     temp_positions, temp_cash = current_positions.copy(), current_cash
     
+    last_valid_market_value = 0
+
     for current_day in trading_days:
         day_ts = pd.Timestamp(current_day)
         market_value = 0
         for t, q in temp_positions.items():
             if q != 0 and t in prices.columns:
                 val = prices.loc[day_ts, t]
+                # Guard against duplicate columns returning a Series instead of float
                 price = val.iloc[0] if isinstance(val, pd.Series) else val
-                market_value += (q * price)
+                if not pd.isna(price):
+                    market_value += (q * price)
         
-        # Create record for this day
+        # Guard against zero market value due to download failures
+        if market_value == 0 and last_valid_market_value > 0:
+            market_value = last_valid_market_value
+        else:
+            last_valid_market_value = market_value
+        
         record = {
             "Date": current_day.date(),
             "Market Value": float(market_value),
@@ -108,12 +113,6 @@ if pos_file and hist_file:
             "Total Portfolio Value": float(market_value + temp_cash),
             "Russell 3000": float(prices.loc[day_ts, "^RUA"]) if "^RUA" in prices.columns else 0.0
         }
-        
-        # Add the Factor ETF prices to the record
-        for ticker in FACTOR_ETFS.keys():
-            if ticker in prices.columns:
-                record[f"Factor_{ticker}"] = float(prices.loc[day_ts, ticker])
-        
         history_records.append(record)
         
         # Backtrack transactions
@@ -128,22 +127,9 @@ if pos_file and hist_file:
     df["Total Portfolio Value"] = pd.to_numeric(df["Total Portfolio Value"])
     df["Date"] = pd.to_datetime(df["Date"])
 
-    # Calculate Turnover
-    buys = hist_df[hist_df['Action'].str.contains('YOU BOUGHT', na=False)]['Amount ($)'].apply(clean_currency).abs().sum()
-    sells = hist_df[hist_df['Action'].str.contains('YOU SOLD', na=False)]['Amount ($)'].apply(clean_currency).abs().sum()
-    avg_value = df['Total Portfolio Value'].mean()
-    
-    turnover_ratio = (min(buys, sells) / avg_value) if avg_value > 0 else 0
-    days_in_period = (end_date - start_date).days
-    annualized_turnover = turnover_ratio * (365 / max(days_in_period, 1))
-
-    # Display Metrics
     st.subheader("Key Portfolio Metrics")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Average AUM", f"${avg_value:,.2f}")
-    m2.metric("Total Buys", f"${buys:,.2f}")
-    m3.metric("Total Sells", f"${sells:,.2f}")
-    m4.metric("Turnover Ratio", f"{turnover_ratio:.2%}")
+    avg_value = df['Total Portfolio Value'].mean()
+    st.metric("Average Portfolio Value", f"${avg_value:,.2f}")
 
     # Charts
     df['Portfolio (Indexed 100)'] = (df['Total Portfolio Value'] / df['Total Portfolio Value'].iloc[0]) * 100
@@ -152,8 +138,5 @@ if pos_file and hist_file:
     st.subheader("Relative Performance (Indexed to 100)")
     st.line_chart(df.set_index("Date")[['Portfolio (Indexed 100)', 'Russell 3000 (Indexed 100)']])
     
-    with st.expander("Detailed History & Factor ETF Data"):
-        st.write("This table includes the daily closing prices for the factor ETFs (IWM, VLUE, MTUM).")
+    with st.expander("Detailed Data Table"):
         st.dataframe(df, use_container_width=True)
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Data (CSV)", csv, "Portfolio_Reconstruction.csv", "text/csv")
