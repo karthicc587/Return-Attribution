@@ -7,7 +7,6 @@ import time
 
 # --- Helper Functions ---
 def clean_currency(value):
-    """Cleans currency and quantity strings: handles $, commas, and negatives in parentheses."""
     if pd.isna(value) or str(value).strip() in ['', '--']: 
         return 0.0
     val_str = str(value).strip()
@@ -23,7 +22,6 @@ def clean_currency(value):
         return 0.0
 
 def extract_date_from_filename(filename):
-    """Extracts date from 'Portfolio_Positions_Apr-15-2026' format."""
     match = re.search(r'([A-Z][a-z]{2}-\d{2}-\d{4})', filename)
     if match:
         return datetime.strptime(match.group(1), '%b-%d-%Y')
@@ -38,6 +36,9 @@ with col1:
     pos_file = st.file_uploader("Upload Positions CSV", type=["csv"])
 with col2:
     hist_file = st.file_uploader("Upload History CSV", type=["csv"])
+
+# Factor ETF Proxies for Excel Regression
+FACTOR_PROXIES = ["IWM", "VLUE", "MTUM"]
 
 if pos_file and hist_file:
     # 1. Load Data
@@ -68,60 +69,63 @@ if pos_file and hist_file:
     hist_df = hist_df.sort_values('Run Date', ascending=False)
     start_date = hist_df['Run Date'].min()
     
-    # Ticker Sanitization: Filter out empty/invalid entries that cause 400 errors
+    # Sanitize Tickers
     raw_tickers = list(set(list(current_positions.keys()) + hist_df['Symbol'].dropna().unique().tolist()))
-    all_tickers = [t.strip() for t in raw_tickers if t and str(t).strip() not in ['', 'nan', 'SPAXX**', 'Cash']]
-    all_tickers = sorted(list(set(all_tickers + ["^RUA"])))
+    clean_tickers = [t.strip() for t in raw_tickers if t and str(t).strip() not in ['', 'nan', 'SPAXX**', 'Cash']]
+    all_req_tickers = sorted(list(set(clean_tickers + ["^RUA"] + FACTOR_PROXIES)))
 
-    # 4. Fetch Historical Prices with Resilience
+    # 4. Fetch Historical Prices
     with st.spinner("Fetching market data..."):
         try:
-            raw_prices = yf.download(all_tickers, start=start_date, end=end_date + pd.Timedelta(days=1), progress=False)['Close']
+            raw_prices = yf.download(all_req_tickers, start=start_date, end=end_date + pd.Timedelta(days=1), progress=False)['Close']
         except Exception:
-            # Short sleep and retry for Rate Limits/Locks
             time.sleep(2)
-            raw_prices = yf.download(all_tickers, start=start_date, end=end_date + pd.Timedelta(days=1), progress=False)['Close']
+            raw_prices = yf.download(all_req_tickers, start=start_date, end=end_date + pd.Timedelta(days=1), progress=False)['Close']
         
-        # Holiday/Gap Fix
         prices = raw_prices.dropna(how='all').ffill().bfill()
 
     # 5. Reconstruct Timeline
     history_records = []
     trading_days = prices.index.sort_values(ascending=False)
-    temp_positions, temp_cash = current_positions.copy(), current_cash
+    temp_pos = current_positions.copy()
+    temp_cash = current_cash
+    last_valid_market_val = 0
     
-    last_valid_market_value = 0
-
     for current_day in trading_days:
         day_ts = pd.Timestamp(current_day)
-        market_value = 0
-        for t, q in temp_positions.items():
+        market_val = 0
+        for t, q in temp_pos.items():
             if q != 0 and t in prices.columns:
                 val = prices.loc[day_ts, t]
-                # Handle potential duplicate columns
                 price = val.iloc[0] if isinstance(val, pd.Series) else val
                 if not pd.isna(price):
-                    market_value += (q * price)
+                    market_val += (q * price)
         
-        # Zero-Drop Guard: If the calculation fails, carry over the next available day's value
-        if market_value == 0 and last_valid_market_value > 0:
-            market_value = last_valid_market_value
+        # Stability Guard
+        if market_val == 0 and last_valid_market_val > 0:
+            market_val = last_valid_market_val
         else:
-            last_valid_market_value = market_value
+            last_valid_market_val = market_val
         
-        history_records.append({
+        record = {
             "Date": current_day.date(),
-            "Market Value": float(market_value),
+            "Market Value": float(market_val),
             "Cash": float(temp_cash),
-            "Total Portfolio Value": float(market_value + temp_cash),
+            "Total Portfolio Value": float(market_val + temp_cash),
             "Russell 3000": float(prices.loc[day_ts, "^RUA"]) if "^RUA" in prices.columns else 0.0
-        })
+        }
+        # Add Factor Proxies for Excel usage
+        for ticker in FACTOR_PROXIES:
+            if ticker in prices.columns:
+                record[ticker] = float(prices.loc[day_ts, ticker])
         
-        # Backtrack transactions
+        history_records.append(record)
+        
+        # Backtrack
         day_tx = hist_df[hist_df['Run Date'].dt.date == current_day.date()]
         for _, tx in day_tx.iterrows():
             ticker, qty = str(tx['Symbol']).strip(), float(tx['Quantity']) if not pd.isna(tx['Quantity']) else 0
-            temp_positions[ticker] = temp_positions.get(ticker, 0) - qty
+            temp_pos[ticker] = temp_pos.get(ticker, 0) - qty
             temp_cash -= clean_currency(tx['Amount ($)'])
 
     # 6. Metrics & Display
@@ -129,7 +133,7 @@ if pos_file and hist_file:
     df["Total Portfolio Value"] = pd.to_numeric(df["Total Portfolio Value"])
     df["Date"] = pd.to_datetime(df["Date"])
 
-    # Calculate Turnover
+    # Turnover Logic: Use MIN of buys/sells
     buys = hist_df[hist_df['Action'].str.contains('YOU BOUGHT', na=False)]['Amount ($)'].apply(clean_currency).abs().sum()
     sells = hist_df[hist_df['Action'].str.contains('YOU SOLD', na=False)]['Amount ($)'].apply(clean_currency).abs().sum()
     avg_value = df['Total Portfolio Value'].mean()
@@ -138,7 +142,6 @@ if pos_file and hist_file:
     days_in_period = (end_date - start_date).days
     annualized_turnover = turnover_ratio * (365 / max(days_in_period, 1))
 
-    # Display Metrics
     st.subheader("Key Portfolio Metrics")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Average AUM", f"${avg_value:,.2f}")
@@ -153,7 +156,8 @@ if pos_file and hist_file:
     st.subheader("Relative Performance (Indexed to 100)")
     st.line_chart(df.set_index("Date")[['Portfolio (Indexed 100)', 'Russell 3000 (Indexed 100)']])
     
-    with st.expander("Detailed History & Downloads"):
+    with st.expander("Detailed History & Factor Data (Excel Export)"):
+        st.write("Factor Proxies: IWM (Size), VLUE (Value), MTUM (Momentum)")
         st.dataframe(df, use_container_width=True)
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Data (CSV)", csv, "Portfolio_Reconstruction.csv", "text/csv")
+        st.download_button("Download Data (CSV)", csv, "Portfolio_Analysis_Export.csv", "text/csv")
